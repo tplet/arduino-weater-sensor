@@ -65,10 +65,10 @@
 // Average cycle duration / sleep time duration in reality (in milliseconds)
 // For each cycle, if probe value change, she's send to gateway
 // Must be >1000ms for DHT22 and >2000ms for DHT11
-static uint32_t CYCLE_DURATION = 600000; // 10 min
+#define CYCLE_DURATION 600000 // 10 min
 // Force sending an update of the probe value after n cycle ; even if probe value not changed since N cycle
 // So, gateway receive minimum of every CYCLE_DURATION * FORCE_SEND_AFTER_N_CYCLE ms a probe updated value
-static uint16_t FORCE_SEND_AFTER_N_CYCLE = 3; // 10 min * 3 = 30min
+#define FORCE_SEND_AFTER_N_CYCLE 3 // 10 min * 3 = 30min
 // Reset software after number of cycle (1 cycle = CYCLE_DURATION)
 #define RESET_AFTER_N_CYCLE 72 // 1h/10min * 12 = 12h
 
@@ -116,8 +116,8 @@ void presentation()
   sendSketchInfo("TemperatureAndHumidity", "1.6.2");
 
   // Register all sensors to gw (they will be created as child devices)
-  present(CHILD_VALUE_ID_HUM, S_HUM);   // Probe value (humidity)
-  present(CHILD_VALUE_ID_TEMP, S_TEMP); // Probe value (temperature)
+  present(CHILD_VALUE_ID_HUM, S_HUM, "Humidity", true);   // Probe value (humidity)
+  present(CHILD_VALUE_ID_TEMP, S_TEMP, "Temperature", true); // Probe value (temperature)
   
   metric = getControllerConfig().isMetric;
 }
@@ -198,10 +198,16 @@ void receive(const MyMessage &message)
   if (message.sensor == CHILD_VALUE_ID_TEMP && message.isAck()) {
     // Ok, remove flag, value has been successfully received by server
     probeValueTempReceived = true;
+    #ifdef MY_DEBUG
+    Serial.println("Server received probe value (temp).");
+    #endif
   }
   else if (message.sensor == CHILD_VALUE_ID_HUM && message.isAck()) {
     // Ok, remove flag, value has been successfully received by server
     probeValueHumReceived = true;
+    #ifdef MY_DEBUG
+    Serial.println("Server received probe value (hum).");
+    #endif
   }
 }
 
@@ -272,7 +278,7 @@ bool processWeather()
     if (probeValue != lastProbeValueTemp || cycleCptTemp == FORCE_SEND_AFTER_N_CYCLE || !probeValueTempReceived) {
       lastProbeValueTemp = probeValue;
       // Reset no updates counter
-      cycleCptTemp = 0;
+      cycleCptTemp = 1;
       r = true;
       // Before send, flag to indicate that server confirmation need to be received
       probeValueTempReceived = false;
@@ -280,8 +286,6 @@ bool processWeather()
       Serial.println("Send value (temperature) to server");
       #endif
       send(messageValueTemp.set(probeValue, 1), true);
-      // Wait for server response
-      wait(1000); // 1s
     } else {
       // Increase no update counter if the temperature stayed the same
       cycleCptTemp++;
@@ -297,7 +301,7 @@ bool processWeather()
     if (probeValue != lastProbeValueHum || cycleCptHum == FORCE_SEND_AFTER_N_CYCLE || !probeValueHumReceived) {
       lastProbeValueHum = probeValue;
       // Reset no updates counter
-      cycleCptHum = 0;
+      cycleCptHum = 1;
       r = true;
       // Before send, flag to indicate that server confirmation need to be received
       probeValueHumReceived = false;
@@ -305,12 +309,15 @@ bool processWeather()
       Serial.println("Send value (humidity) to server");
       #endif
       send(messageValueHum.set(probeValue, 1), true);
-      // Wait for server response
-      wait(1000); // 1s
     } else {
       // Increase no update counter if the humidity stayed the same
       cycleCptHum++;
     }
+  }
+
+  // If data has been sended to server, wait for ack confirmation
+  if (r) {
+      wait(1000); // 1s    
   }
 
   return r;
