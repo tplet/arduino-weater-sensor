@@ -32,7 +32,7 @@
  */
 
 // Enable debug prints
-#define MY_DEBUG
+//#define MY_DEBUG
 
 // Enable and select radio type attached 
 #define MY_RADIO_NRF24
@@ -68,7 +68,7 @@
 static uint32_t CYCLE_DURATION = 600000; // 10 min
 // Force sending an update of the probe value after n cycle ; even if probe value not changed since N cycle
 // So, gateway receive minimum of every CYCLE_DURATION * FORCE_SEND_AFTER_N_CYCLE ms a probe updated value
-static uint16_t FORCE_SEND_AFTER_N_CYCLE = 3; // 20 min * 3 = 1h
+static uint16_t FORCE_SEND_AFTER_N_CYCLE = 3; // 10 min * 3 = 30min
 // Reset software after number of cycle (1 cycle = CYCLE_DURATION)
 #define RESET_AFTER_N_CYCLE 72 // 1h/10min * 12 = 12h
 
@@ -88,14 +88,9 @@ static uint16_t FORCE_SEND_AFTER_N_CYCLE = 3; // 20 min * 3 = 1h
 // Node childs id (local to node)
 #define CHILD_VALUE_ID_HUM 0
 #define CHILD_VALUE_ID_TEMP 1
-#define CHILD_RESET_ID 2
-#define CHILD_CONFIG_ID 3
 // Message which contain probe value
 MyMessage messageValueHum(CHILD_VALUE_ID_HUM, V_HUM);
 MyMessage messageValueTemp(CHILD_VALUE_ID_TEMP, V_TEMP);
-MyMessage messageReset(CHILD_RESET_ID, V_STATUS);
-MyMessage messageConfigCycleDuration(CHILD_CONFIG_ID, V_VAR1);
-MyMessage messageConfigCycleN(CHILD_CONFIG_ID, V_VAR2);
 // Battery gauge
 MAX17043 batteryGauge;
 // Probe
@@ -109,7 +104,8 @@ uint16_t cycleCptHum;
 uint16_t cycleCptReset;
 uint8_t batteryLowCpt;
 bool metric = true;
-
+bool probeValueTempReceived = true;
+bool probeValueHumReceived = true;
 
 /**
  * Init node to gateway
@@ -117,14 +113,12 @@ bool metric = true;
 void presentation()  
 { 
   // Send the sketch version information to the gateway
-  sendSketchInfo("TemperatureAndHumidity", "1.6.1");
+  sendSketchInfo("TemperatureAndHumidity", "1.6.2");
 
   // Register all sensors to gw (they will be created as child devices)
   present(CHILD_VALUE_ID_HUM, S_HUM);   // Probe value (humidity)
   present(CHILD_VALUE_ID_TEMP, S_TEMP); // Probe value (temperature)
-  present(CHILD_RESET_ID, S_BINARY);    // Reset command
-  present(CHILD_CONFIG_ID, S_CUSTOM);   // Configuration
-
+  
   metric = getControllerConfig().isMetric;
 }
 
@@ -136,6 +130,8 @@ void setup()
   // Keep reset pin HIGH (need to be the first command to prevent infinite reset!)
   digitalWrite(RESET_PIN, HIGH);
 
+  // Configure pin
+  pinMode(RESET_PIN, OUTPUT);
   
   // 
   // DHT
@@ -176,17 +172,12 @@ void setup()
  * Loop
  */
 void loop()      
-{  
-  // Battery level (%)
-  processBattery();
-  
-  // Probe value: If value has been sended, take the opportunity to make some check from server
-  if (processWeather()) {
-    // Configuration
-    processCheckCommandFromServer();
-    // Reset
-    processCheckResetFromServer();
-  }
+{    
+  // Probe value: If value send to server, allow to send others values
+  bool allowSend = processWeather();
+
+  // Battery level
+  processBattery(allowSend);
 
   // Reset
   processReset();
@@ -199,59 +190,21 @@ void loop()
 }
 
 /**
- * When receive message
+ * Receive message
  */
 void receive(const MyMessage &message)
 {
-  // Expect one type of message from gateway. Check it
-  if (
-    message.sensor == CHILD_RESET_ID && 
-    message.type == V_STATUS
-  ) {
-    #ifdef MY_DEBUG
-    Serial.print("Message received. Require for reset: ");
-    Serial.println(message.getBool());
-    #endif
-    // If reset requested
-    if (message.getBool()) {
-      // Restart node
-      restart();
-    }
+  // ACK to confirm that probe value right received
+  if (message.sensor == CHILD_VALUE_ID_TEMP && message.isAck()) {
+    // Ok, remove flag, value has been successfully received by server
+    probeValueTempReceived = true;
   }
-  // Receive configuration
-  else if (
-    message.sensor == CHILD_CONFIG_ID && 
-    (message.type == V_VAR1 || message.type == V_VAR2)
-  ) {
-    #ifdef MY_DEBUG
-    Serial.println("Config received.");
-    #endif
-    // Configure cycle duration
-    if (message.type == V_VAR1) {
-      uint32_t v = message.getULong();
-      if (v > 0) {
-        #ifdef MY_DEBUG
-        Serial.print("Configure cycle duration: ");
-        Serial.print(v);
-        Serial.println(" ms");
-        #endif
-        CYCLE_DURATION = v;
-      }
-    }
-    // Configure number of cycle to force update
-    else if (message.type == V_VAR2 ) {
-      uint16_t v = message.getUInt();
-      if (v > 0) {
-        #ifdef MY_DEBUG
-        Serial.print("Configure number of cycle to force update: ");
-        Serial.print(v);
-        Serial.println(" ms");
-        #endif
-        FORCE_SEND_AFTER_N_CYCLE = v;
-      }
-    }
+  else if (message.sensor == CHILD_VALUE_ID_HUM && message.isAck()) {
+    // Ok, remove flag, value has been successfully received by server
+    probeValueHumReceived = true;
   }
 }
+
 
 /**
  * Restart
@@ -272,8 +225,6 @@ void doRestart(bool software)
   Serial.println("Restart node");
   #endif
 
-  // Before restart, set reset value to off
-  send(messageReset.set(false));
   cycleCptReset = 0;
 
   // Restart software
@@ -318,15 +269,19 @@ bool processWeather()
     Serial.println(probeValue);
     #endif
     // Only send probe value (temperature) if it changed since the last measurement or if we didn't send an update for n times
-    if (probeValue != lastProbeValueTemp || cycleCptTemp == FORCE_SEND_AFTER_N_CYCLE) {
+    if (probeValue != lastProbeValueTemp || cycleCptTemp == FORCE_SEND_AFTER_N_CYCLE || !probeValueTempReceived) {
       lastProbeValueTemp = probeValue;
       // Reset no updates counter
       cycleCptTemp = 0;
       r = true;
+      // Before send, flag to indicate that server confirmation need to be received
+      probeValueTempReceived = false;
       #ifdef MY_DEBUG
       Serial.println("Send value (temperature) to server");
       #endif
-      send(messageValueTemp.set(probeValue, 1));
+      send(messageValueTemp.set(probeValue, 1), true);
+      // Wait for server response
+      wait(1000); // 1s
     } else {
       // Increase no update counter if the temperature stayed the same
       cycleCptTemp++;
@@ -339,15 +294,19 @@ bool processWeather()
     Serial.println(probeValue);
     #endif
     // Only send probe value (humidity) if it changed since the last measurement or if we didn't send an update for n times
-    if (probeValue != lastProbeValueHum || cycleCptHum == FORCE_SEND_AFTER_N_CYCLE) {
+    if (probeValue != lastProbeValueHum || cycleCptHum == FORCE_SEND_AFTER_N_CYCLE || !probeValueHumReceived) {
       lastProbeValueHum = probeValue;
       // Reset no updates counter
       cycleCptHum = 0;
       r = true;
+      // Before send, flag to indicate that server confirmation need to be received
+      probeValueHumReceived = false;
       #ifdef MY_DEBUG
       Serial.println("Send value (humidity) to server");
       #endif
-      send(messageValueHum.set(probeValue, 1));
+      send(messageValueHum.set(probeValue, 1), true);
+      // Wait for server response
+      wait(1000); // 1s
     } else {
       // Increase no update counter if the humidity stayed the same
       cycleCptHum++;
@@ -381,8 +340,10 @@ void initBattery()
  * Process to read battery and send level
  * 
  * If battery level lower than limit, inter into deep sleep mode!
+ * 
+ * @param bool allowSend Allow to send battery level to server
  */
-void processBattery()
+void processBattery(bool allowSend)
 {
   #ifdef BATTERY_ON
   
@@ -392,7 +353,12 @@ void processBattery()
   Serial.print(batteryLevel);
   Serial.println("%");
   #endif
-  sendBatteryLevel(batteryLevel);
+  
+  // Send battery level to server
+  if (allowSend) {
+    sendBatteryLevel(batteryLevel);
+  }
+
   // If lower that battery low limit, waiting for n consecutive check
   if (batteryLevel < BATTERY_LOW_LIMIT) {
     batteryLowCpt++;
@@ -400,6 +366,7 @@ void processBattery()
   } else {
     batteryLowCpt = 0;
   }
+  
   // If battery low confirmed
   if (batteryLowCpt >= SEND_BATTERY_LOW_AFTER_N_CYCLE) {
     batteryLowCpt = 0;
@@ -428,23 +395,3 @@ void processReset()
   }
 }
 
-/**
- * Process a check reset command from server
- */
-void processCheckResetFromServer()
-{
-  // Retrieve reset value from gateways (if order to restard has been sended)
-  request(CHILD_RESET_ID, V_STATUS, 0);
-  wait(1000); // Waiting for answer
-}
-
-/**
- * Process a check config command from server
- */
-void processCheckCommandFromServer()
-{
-  // Request configuration
-  request(CHILD_CONFIG_ID, V_VAR1, 0); // Cycle duration
-  request(CHILD_CONFIG_ID, V_VAR2, 0); // Number of cycle
-  wait(1000); // Waiting for answer
-}
